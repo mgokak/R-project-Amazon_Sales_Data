@@ -1,0 +1,644 @@
+---
+title: "Amazon Data Project"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r EDA}
+library(tidyverse)
+library(GGally)
+library(caret)
+
+# Read csv
+amazon <- read.csv("M:/MVG/FALL CLASSES/FundamentalsOfDS_R/finalProject/AmazonSaleReport.csv")
+
+dim(amazon)
+head(amazon)
+str(amazon)
+
+# Convert categorical to factors
+amazon <- amazon %>%
+  mutate(
+    Status        = as.factor(Status),
+    Fulfilment    = as.factor(Fulfilment),
+    Sales.Channel = as.factor(Sales.Channel),
+    Category      = as.factor(Category),
+    ship.city     = as.factor(ship.city),
+    ship.state    = as.factor(ship.state),
+    ship.country  = as.factor(ship.country),
+    B2B           = as.factor(B2B)
+  )
+
+summary(amazon)
+str(amazon)
+
+# 5-point summary and histogram for numeric data
+summary(amazon$Amount)
+summary(amazon$Qty)
+
+ggplot(amazon, aes(x = Amount)) +
+  geom_histogram(binwidth = 100, fill = "lightblue", color = "black") +
+  labs(
+    title = "Distribution of Order Amount",
+    x = "Amount",
+    y = "Frequency"
+  )
+
+ggplot(amazon, aes(x = Qty)) +
+  geom_histogram(binwidth = 1, fill = "lightgreen", color = "black") +
+  labs(
+    title = "Distribution of Quantity",
+    x = "Quantity",
+    y = "Frequency"
+  )
+
+# Boxplot to see outliers for numerical
+ggplot(amazon, aes(y=Amount)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = " Boxplot of order Amount",
+       y = "Amount")
+
+ggplot(amazon, aes(x = Status, y = Amount)) +
+  geom_boxplot() +
+  labs(
+    title = "Amount by Order Status",
+    x = "Status",
+    y = "Amount"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Barplots and Stacked Barplots for categorical
+ggplot(amazon, aes(x = Status)) +
+  geom_bar(fill = "lightblue") +
+  labs(
+    title = "Order Count by Status",
+    x = "Status",
+    y = "Count",
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(amazon, aes(x = Status, fill = Fulfilment)) +
+  geom_bar() +
+  labs(
+    title = "Orders by Status and Fulfilment",
+    x = "Status",
+    y = "Count",
+    fill = "Fulfilment"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Cross-table for Status and Fulfilment  
+table(amazon$Status, amazon$Fulfilment)
+
+# Scatterplot for numeric
+amazon_num <- amazon %>%
+  select(Qty, Amount)
+
+ggpairs(amazon_num)
+
+```
+
+```{r Preprocessing}
+# Convert to Date format
+amazon$Date <- as.Date(amazon$Date, format = "%d-%m-%Y")
+
+colnames(amazon) <- trimws(colnames(amazon))
+names(amazon)
+
+colSums(is.na(amazon))
+
+sum(duplicated(amazon))
+
+# Dropping useless columns
+amazon <- amazon %>%
+  select(-promotion.ids, -Unnamed..22, -index)
+
+# Handling Numeric Columns
+amazon <- amazon %>%
+  filter(!is.na(Amount),
+         !is.na(currency))
+
+amazon <- amazon %>%
+  filter(!is.na(ship.city),
+         !is.na(ship.state),
+         !is.na(ship.postal.code),
+         !is.na(ship.country))
+
+# Detect and Remove Outliers (IQR)
+remove_outliers_iqr <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR = Q3 - Q1
+  
+  lower <- Q1 - 1.5 * IQR
+  upper <- Q3 + 1.5 * IQR
+  
+  x >= lower & x <= upper
+}
+
+# Apply to Amount
+keep_amount <- remove_outliers_iqr(amazon$Amount)
+table(keep_amount)   # see how many kept/removed
+
+amazon_clean <- amazon[keep_amount, ]
+
+# Check boxplot again after removing outliers
+ggplot(amazon_clean, aes(y = Amount)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(
+    title = "Boxplot of Amount After Removing Outliers",
+    y = "Amount"
+  )
+
+# Log Transform + Scaling
+hist(amazon_clean$Amount,
+     main = "Amount Before Log Transform",
+     xlab = "Amount")
+
+amazon_clean$logAmount <- log1p(amazon_clean$Amount)
+
+hist(amazon_clean$logAmount,
+     main = "Amount After Log Transform",
+     xlab = "log(Amount + 1)")
+
+```
+
+```{r Target value Y and Multicollinearity}
+# Target Variable
+target <- amazon_clean$Amount
+
+library(corrplot)
+
+amazon_numeric <- amazon_clean %>% 
+  select_if(is.numeric)
+
+str(amazon_numeric)
+
+# Correlation matrix and heatmap
+cor_mat_num <- cor(amazon_numeric, use = "pairwise.complete.obs")
+
+library(corrplot)
+
+corrplot(
+  cor_mat_num,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.8,
+  tl.col = "black",
+  addCoef.col = NA,
+  main  = "Correlation Heatmap (Numeric Variables Only)",
+  mar   = c(0,0,2,0)
+)
+
+```
+
+```{r Variable Screening}
+library(dplyr)
+library(MASS)
+library(car)
+library(glmnet)
+
+model_df <- amazon_clean %>%
+  dplyr::select(
+    Amount,     
+    Qty,           
+    Size,          
+    Status,
+    Fulfilment,
+    Sales.Channel,
+    Category,
+    B2B,
+    #ship.state,
+    #ship.country
+  )
+
+# Dummy variables
+dummy <- dummyVars(Amount ~ ., data = model_df)
+predictors <- data.frame(predict(dummy, newdata = model_df))
+
+reg_data <- cbind(Amount = model_df$Amount, predictors)
+
+# Remove zero-variance predictors
+zero_var <- sapply(reg_data, function(x) sd(x, na.rm = TRUE) == 0)
+reg_data <- reg_data[, !zero_var]
+
+str(reg_data)
+
+# 1st-order Model
+model_1st_full <- lm(Amount ~ ., data = reg_data)
+summary(model_1st_full)
+
+# stepAIC for variable screening
+model_1st <- stepAIC(model_1st_full, direction = "both", trace = FALSE)
+summary(model_1st)
+
+# Final predictors after stepAIC
+model_1st$call
+
+final_features <- names(coef(model_1st))[-1]
+final_features
+
+```
+
+```{r Regression Model}
+# Train-Test Split
+set.seed(123)
+train_idx <- createDataPartition(reg_data$Amount, p = 0.8, list = FALSE)
+
+train_data <- reg_data[train_idx, ]
+test_data  <- reg_data[-train_idx, ]
+
+# 1st-Order Model
+lm_1st <- lm(formula(model_1st), data = train_data)
+summary(lm_1st)
+
+# 2nd-Order Model
+reg_data_2nd <- reg_data %>%
+  mutate(
+    Qty2 = Qty^2
+  )
+
+model_2nd_full <- lm(Amount ~ ., data = reg_data_2nd)
+summary(model_2nd_full)
+
+# Interaction Model
+model_int_full <- lm(
+  Amount ~ (Qty + Size + Status + Category + Fulfilment + B2B)^2,
+  data = model_df
+)
+summary(model_int_full)
+
+# VIF - Check Multicollinearity
+vif_1st <- vif(lm_1st)
+vif_1st
+max_vif_1st <- max(vif_1st)
+max_vif_1st
+
+# RIDGE and LASSO Regression
+if(max_vif_1st > 5) {
+  x <- model.matrix(formula(model_1st), data = reg_data)[,-1]
+  y <- reg_data$Amount
+  
+  x_train <- x[train_idx, ]
+  x_test  <- x[-train_idx, ]
+  y_train <- y[train_idx]
+  y_test  <- y[-train_idx]
+  
+  # RIDGE
+  cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0)
+  pred_ridge <- predict(cv_ridge, s = cv_ridge$lambda.min, newx = x_test)
+  ridge_rmse <- sqrt(mean((pred_ridge - y_test)^2))
+
+  # LASSO
+  cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1)
+  pred_lasso <- predict(cv_lasso, s = cv_lasso$lambda.min, newx = x_test)
+  lasso_rmse <- sqrt(mean((pred_lasso - y_test)^2))
+
+  print(paste("Ridge RMSE:", ridge_rmse))
+  print(paste("LASSO RMSE:", lasso_rmse))
+
+} else {
+  print("VIF < 5 — Ridge/LASSO NOT required.")
+}
+
+# Cross-Validation
+set.seed(123)
+train_control <- trainControl(method = "cv", number = 10)
+
+cv_model <- train(
+  formula(model_1st),
+  data = train_data,
+  method = "lm",
+  trControl = train_control
+)
+
+cv_model
+
+# Residual Analysis
+par(mfrow = c(2,2))
+plot(lm_1st)
+par(mfrow = c(1,1))
+
+res <- resid(lm_1st)
+fit <- fitted(lm_1st)
+
+plot(fit, res, main="Residuals vs Fitted"); abline(h=0,col="red")
+hist(res, main="Histogram of Residuals")
+qqnorm(res); qqline(res, col="red")
+
+# When using Amount as the target, residual diagnostics showed strong violation of 
+# linear regression assumptions (non-linearity, heteroscedasticity, non-normal errors). 
+# Therefore, a log transformation will be applied and used to build model.
+
+model_df <- amazon_clean %>%
+  dplyr::select(
+    logAmount,
+    Qty,
+    Size,
+    Status,
+    Fulfilment,
+    Sales.Channel,
+    Category,
+    B2B
+  )
+
+dummy <- dummyVars(logAmount ~ ., data = model_df)
+predictors <- data.frame(predict(dummy, newdata = model_df))
+
+reg_data <- cbind(logAmount = model_df$logAmount, predictors)
+
+zero_var <- sapply(reg_data, function(x) sd(x, na.rm = TRUE) == 0)
+reg_data <- reg_data[, !zero_var]
+str(reg_data)
+
+# 1st Order
+model_1st_full <- lm(logAmount ~ ., data = reg_data)
+summary(model_1st_full)
+
+# StepAIC
+model_1st <- stepAIC(model_1st_full, direction = "both", trace = FALSE)
+summary(model_1st)
+
+# Train-Test Split
+set.seed(123)
+train_idx <- createDataPartition(reg_data$logAmount, p = 0.7, list = FALSE)
+
+train_data <- reg_data[train_idx, ]
+test_data  <- reg_data[-train_idx, ]
+
+# 1st-Order
+lm_1st <- lm(formula(model_1st), data = train_data)
+summary(lm_1st)
+
+# 2nd-Order
+reg_data_2nd <- reg_data %>%
+  mutate(
+    Qty2 = Qty^2
+  )
+
+model_2nd_full <- lm(logAmount ~ ., data = reg_data_2nd)
+summary(model_2nd_full)
+
+model_2nd <- stepAIC(model_2nd_full, direction = "both", trace = FALSE)
+summary(model_2nd)
+
+# Interaction model
+model_int_full <- lm(logAmount ~ (Qty + Size + Status + Category + Fulfilment + B2B)^2,
+  data = model_df
+)
+summary(model_int_full)
+
+# Check Multicollinearity
+vif_1st <- vif(lm_1st)
+vif_1st
+max_vif <- max(vif_1st)
+max_vif
+
+# High Collinearity, applying RIDGE and LASSO
+# RIDGE and LASSO Regression
+if(max_vif > 5) {
+  x <- model.matrix(formula(model_1st), data = reg_data)[,-1]
+  y <- reg_data$logAmount
+  
+  x_train <- x[train_idx, ]
+  x_test  <- x[-train_idx, ]
+  y_train <- y[train_idx]
+  y_test  <- y[-train_idx]
+  
+  # RIDGE
+  cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0)
+  pred_ridge <- predict(cv_ridge, s = cv_ridge$lambda.min, newx = x_test)
+  ridge_rmse <- sqrt(mean((pred_ridge - y_test)^2))
+
+  # LASSO
+  cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1)
+  pred_lasso <- predict(cv_lasso, s = cv_lasso$lambda.min, newx = x_test)
+  lasso_rmse <- sqrt(mean((pred_lasso - y_test)^2))
+
+  print(paste("Ridge RMSE:", ridge_rmse))
+  print(paste("LASSO RMSE:", lasso_rmse))
+
+} else {
+  print("VIF < 5 — Ridge/LASSO NOT required.")
+}
+
+# Croff Validation (10 fold)
+set.seed(123)
+train_control <- trainControl(method = "cv", number = 10)
+
+cv_model <- train(
+  formula(model_1st),
+  data = train_data,
+  method = "lm",
+  trControl = train_control
+)
+
+cv_model
+
+# Residual Analysis
+res <- resid(lm_1st)
+fit <- fitted(lm_1st)
+
+par(mfrow = c(2,2))
+plot(lm_1st)
+par(mfrow = c(1,1))
+
+plot(fit, res, main="Residuals vs Fitted"); abline(h=0, col="red")
+hist(res, main="Histogram of Residuals")
+qqnorm(res); qqline(res, col="red")
+
+# On-test set, Actual vs Predicted
+pred_test <- predict(lm_1st, newdata = test_data)
+
+library(ggplot2)
+
+ggplot(data.frame(Actual=test_data$logAmount, Predicted=pred_test),
+       aes(x=Actual, y=Predicted)) +
+  geom_point(alpha=0.4) +
+  geom_abline(slope=1, intercept=0, color="red") +
+  labs(title="Actual vs Predicted (logAmount)",
+       x="Actual logAmount", y="Predicted logAmount")
+
+# RMSE Comparison for all Models
+rmse_1st <- sqrt(mean((pred_test - test_data$logAmount)^2))
+rmse_1st
+
+rmse_2nd <- sqrt(mean((predict(model_2nd, newdata=reg_data_2nd[-train_idx, ]) 
+                       - test_data$logAmount)^2))
+rmse_2nd
+
+# The RMSE comparison shows that all four models perform almost equally well, with only 
+# very small differences between them. The 2nd-order interaction model gives the lowest 
+# RMSE (0.92559), but the improvement over the simpler 1st-order model (0.92599) is extremely 
+# small and not practically meaningful. Ridge (0.92621) and LASSO (0.92601) also produce RMSE 
+# values very close to the basic model, indicating that regularization does not provide a major 
+# accuracy benefit. Overall, although the 2nd-order model is technically the most accurate, the 
+# gain is minimal, so the simpler 1st-order or LASSO model is often preferred because they are 
+# easier to interpret and explain while offering nearly the same predictive performance.
+
+```
+
+```{r Classification}
+library(rpart)
+library(rpart.plot)
+library(kknn)
+library(nnet)
+
+class_df3 <- amazon_clean %>%
+  mutate(
+    Status_group1 = case_when(
+      Status == "Shipped - Delivered to Buyer" ~ "Delivered",
+      Status == "Cancelled" ~ "Cancelled",
+      TRUE ~ "InProcess"
+    )
+  )
+
+class_df3$FulfilmentMerchant <- NULL
+
+# Convert to factors
+class_df3$Status_group1 <- factor(class_df3$Status_group1)
+class_df3$Fulfilment <- factor(class_df3$Fulfilment,
+                               levels = c("Amazon", "Merchant"))
+
+# Select predictors
+class_df4 <- class_df3 %>%
+  dplyr::select(Status_group1, Qty, Size, Fulfilment, Category, B2B, logAmount)
+
+# Train-Test Split
+set.seed(123)
+train_idx1 <- createDataPartition(class_df4$Status_group1, p = 0.8, list = FALSE)
+
+train_multi  <- class_df4[train_idx1, ]
+test_multi   <- class_df4[-train_idx1, ]
+
+ctrl <- trainControl(method = "cv", number = 5)
+
+# Logistic Regression
+model_logit <- train(
+  Status_group1 ~ Qty + Size + Fulfilment + Category + B2B + logAmount,
+  data = train_multi,
+  method = "multinom",
+  trControl = ctrl,
+  trace = FALSE
+)
+
+pred_logit <- predict(model_logit, newdata = test_multi)
+confusionMatrix(pred_logit, test_multi$Status_group1)
+
+# Decision Tree
+
+model_tree <- train(
+  Status_group1 ~ Qty + Size + Fulfilment + Category + B2B + logAmount,
+  data = train_multi,
+  method = "rpart",
+  trControl = ctrl,
+  tuneLength = 10
+)
+
+rpart.plot(
+  model_tree$finalModel,
+  type = 2,
+  extra = 104,
+  fallen.leaves = TRUE,
+  tweak = 1.2,
+  under = TRUE,
+  varlen = 0,
+  split.fun = function(x, labs, digits, varlen, faclen) {
+    labs <- gsub("FulfilmentMerchant = 1", "Fulfilment = Merchant", labs)
+    labs <- gsub("FulfilmentMerchant = 0", "Fulfilment = Amazon", labs)
+    labs <- gsub("FulfilmentMerchant", "Fulfilment", labs)
+    labs
+  }
+)
+
+pred_tree <- predict(model_tree, newdata = test_multi)
+confusionMatrix(pred_tree, test_multi$Status_group1)
+
+# k-NN
+model_knn <- kknn(
+  Status_group1 ~ Qty + Size + Fulfilment + Category + B2B + logAmount,
+  train = train_multi,
+  test  = test_multi,
+  k = 5,
+  kernel = "rectangular"
+)
+
+pred_knn <- fitted(model_knn)
+confusionMatrix(pred_knn, test_multi$Status_group1)
+
+# Tune k for kNN
+k_values <- c(3,5,7,9,11)
+accuracies <- c()
+
+for (k in k_values) {
+  mdl <- kknn(
+    Status_group1 ~ Qty + Size + Fulfilment + Category + B2B + logAmount,
+    train = train_multi,
+    test = test_multi,
+    k = k
+  )
+  preds <- fitted(mdl)
+  acc <- confusionMatrix(preds, test_multi$Status_group1)$overall["Accuracy"]
+  accuracies <- c(accuracies, acc)
+}
+
+data.frame(k = k_values, Accuracy = accuracies)
+
+# Accuracy Comparison
+acc_logit <- confusionMatrix(pred_logit, test_multi$Status_group1)$overall["Accuracy"]
+acc_tree  <- confusionMatrix(pred_tree, test_multi$Status_group1)$overall["Accuracy"]
+acc_knn   <- confusionMatrix(pred_knn,  test_multi$Status_group1)$overall["Accuracy"]
+
+data.frame(
+  Model = c("Logistic Regression", "Decision Tree", "kNN"),
+  Accuracy = c(acc_logit, acc_tree, acc_knn)
+)
+
+```
+
+```{r Clustering}
+cluster_df <- amazon_clean %>%
+  dplyr::select(Qty, logAmount)
+
+cluster_scaled <- scale(cluster_df)
+
+# Elbow method to determine k
+set.seed(123)
+
+wss <- vector()
+
+for (k in 1:10) {
+  km <- kmeans(cluster_scaled, centers = k, nstart = 20)
+  wss[k] <- km$tot.withinss
+}
+
+plot(
+  1:10, wss, type = "b", pch = 19,
+  xlab = "Number of Clusters (K)",
+  ylab = "Total Within-Cluster Sum of Squares",
+  main = "Elbow Method for Choosing K"
+)
+
+# k-Means
+set.seed(123)
+kmeans_fit <- kmeans(cluster_scaled, centers = 3, nstart = 25)
+
+# Add Cluster to the dataset
+amazon_clean$Cluster <- factor(kmeans_fit$cluster)
+str(amazon_clean)
+
+# Visualize
+library(ggplot2)
+
+ggplot(amazon_clean, aes(x = Qty, y = logAmount, color = Cluster)) +
+  geom_point(alpha = 0.4) +
+  labs(title = "K-means Clustering", x = "Qty", y = "logAmount")
+
+kmeans_fit$centers
+
+```
+
